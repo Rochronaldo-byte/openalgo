@@ -3,20 +3,20 @@
 import os
 import pandas as pd
 import requests
-import gzip
-import shutil
 from datetime import datetime
 
-from sqlalchemy import create_engine, Column, Integer, String, Float , Sequence, Index
+from sqlalchemy import create_engine, Column, Integer, String, Float, Sequence, Index
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
-from extensions import socketio  # Import SocketIO
+
+from database.auth_db import get_auth_token, Auth
+from extensions import socketio
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-DATABASE_URL = os.getenv('DATABASE_URL')  # Replace with your database path
+DATABASE_URL = os.getenv('DATABASE_URL')
 
 engine = create_engine(DATABASE_URL)
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
@@ -26,19 +26,18 @@ Base.query = db_session.query_property()
 class SymToken(Base):
     __tablename__ = 'symtoken'
     id = Column(Integer, Sequence('symtoken_id_seq'), primary_key=True)
-    symbol = Column(String, nullable=False, index=True)  # Single column index
-    brsymbol = Column(String, nullable=False, index=True)  # Single column index
+    symbol = Column(String, nullable=False, index=True)
+    brsymbol = Column(String, nullable=False, index=True)
     name = Column(String)
-    exchange = Column(String, index=True)  # Include this column in a composite index
-    brexchange = Column(String, index=True)  
-    token = Column(String, index=True)  # Indexed for performance
+    exchange = Column(String, index=True)
+    brexchange = Column(String, index=True)
+    token = Column(String, index=True)
     expiry = Column(String)
     strike = Column(Float)
     lotsize = Column(Integer)
     instrumenttype = Column(String)
     tick_size = Column(Float)
 
-    # Define a composite index on symbol and exchange columns
     __table_args__ = (Index('idx_symbol_exchange', 'symbol', 'exchange'),)
 
 def init_db():
@@ -63,7 +62,7 @@ def copy_from_dataframe(df):
 
     # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
+        if filtered_data_dict:
             db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
             db_session.commit()
             logger.info(f"Bulk insert completed successfully with {len(filtered_data_dict)} new records.")
@@ -73,164 +72,127 @@ def copy_from_dataframe(df):
         logger.error(f"Error during bulk insert: {e}")
         db_session.rollback()
 
-def download_json_angel_data(url, output_path):
+
+def download_nubra_instruments(output_path):
     """
-    Downloads a JSON file from the specified URL and saves it to the specified path.
+    Downloads instrument data from Nubra API for NSE and BSE exchanges.
     """
-    logger.info("Downloading JSON data")
-    response = requests.get(url, timeout=10)  # timeout after 10 seconds
-    if response.status_code == 200:  # Successful download
-        with open(output_path, 'wb') as f:
-            f.write(response.content)
-        logger.info("Download complete")
-    else:
-        logger.error(f"Failed to download data. Status code: {response.status_code}")
+    date = datetime.now().strftime('%Y-%m-%d')
+
+    # Get the logged-in username for nubra broker from database
+    auth_obj = Auth.query.filter_by(broker='nubra', is_revoked=False).first()
+    if not auth_obj:
+        raise Exception("No active Nubra session found. Please login first.")
+
+    login_username = auth_obj.name
+    auth_token = get_auth_token(login_username)
+
+    if not auth_token:
+        raise Exception(f"No valid auth token found for user '{login_username}'. Please login first.")
+
+    headers = {
+        'Authorization': f'Bearer {auth_token}',
+        'x-device-id': 'OPENALGO'
+    }
+
+    all_data = []
+
+    for exchange in ['NSE', 'BSE']:
+        url = f'https://api.nubra.io/refdata/refdata/{date}?exchange={exchange}'
+        logger.info(f"Downloading Nubra instruments for {exchange}")
+
+        response = requests.get(url, headers=headers, timeout=15)
+
+        if response.status_code != 200:
+            logger.error(f"{exchange} failed: {response.text}")
+            continue
+
+        payload = response.json()
+        if 'refdata' in payload:
+            all_data.extend(payload['refdata'])
+
+    if not all_data:
+        raise Exception("No Nubra instruments downloaded")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    pd.DataFrame(all_data).to_json(output_path, orient='records')
+    logger.info(f"Download complete with {len(all_data)} instruments")
 
 
-def reformat_symbol(row):
-    symbol = row['symbol']
-    instrument_type = row['instrumenttype']
-    
-    if instrument_type == 'FUT':
-        # For FUT, remove the spaces and append 'FUT' at the end
-        parts = symbol.split(' ')
-        if len(parts) == 5:  # Make sure the symbol has the correct format
-            symbol = parts[0] + parts[2] + parts[3] + parts[4] + parts[1]
-    elif instrument_type in ['CE', 'PE']:
-        # For CE/PE, rearrange the parts and remove spaces
-        parts = symbol.split(' ')
-        if len(parts) == 6:  # Make sure the symbol has the correct format
-            symbol = parts[0] + parts[3] + parts[4] + parts[5] + parts[1] + parts[2]
-    else:
-        symbol = symbol  # No change for other instrument types
-
-    return symbol
-
-
-def convert_date(date_str):
-    # Convert from '19MAR2024' to '19-MAR-24'
-    try:
-        return datetime.strptime(date_str, '%d%b%Y').strftime('%d-%b-%y')
-    except ValueError:
-        # Return the original date if it doesn't match the format
-        return date_str
-
-def process_angel_json(path):
+def process_nubra_json(path):
     """
-    Processes the Angel JSON file to fit the existing database schema.
-    Args:
-    path (str): The file path of the downloaded JSON data.
-
-    Returns:
-    DataFrame: The processed DataFrame ready to be inserted into the database.
+    Processes the Nubra JSON file to fit the existing database schema.
     """
-    # Read JSON data into a DataFrame
     df = pd.read_json(path)
-    
-    # Rename the columns based on the database schema
-    # Assuming that the JSON structure matches the sample response provided
-    df = df.rename(columns={
-        'exch_seg': 'exchange',
-        'instrumenttype': 'instrumenttype',
-        'lotsize': 'lotsize',
-        'strike': 'strike',
-        'symbol': 'symbol',
-        'token': 'token',
-        'name': 'name',
-        'tick_size': 'tick_size'
-    })
-    
-    # Reformat 'symbol' column if needed (based on the given reformat_symbol function)
-    #df['symbol'] = df.apply(lambda row: reformat_symbol(row), axis=1)
-    
-    
-    # Assuming 'brsymbol' and 'brexchange' are not present in the JSON and are the same as 'symbol' and 'exchange'
-    df['brsymbol'] = df['symbol']
+
+    # Basic field mappings
+    df['token'] = df['token'].astype(str)
+    df['lotsize'] = df['lot_size']
+    df['tick_size'] = df['tick_size'].astype(float)
+    df['name'] = df['asset']
+    df['brsymbol'] = df['stock_name']
     df['brexchange'] = df['exchange']
 
-     # Update exchange names based on the instrument type
-    df.loc[(df['instrumenttype'] == 'AMXIDX') & (df['exchange'] == 'NSE'), 'exchange'] = 'NSE_INDEX'
-    df.loc[(df['instrumenttype'] == 'AMXIDX') & (df['exchange'] == 'BSE'), 'exchange'] = 'BSE_INDEX'
-    df.loc[(df['instrumenttype'] == 'AMXIDX') & (df['exchange'] == 'MCX'), 'exchange'] = 'MCX_INDEX'
-    
-    # Reformat 'symbol' based on 'brsymbol'
-    df['symbol'] = df['symbol'].str.replace('-EQ|-BE|-MF|-SG', '', regex=True)
-    
-    
-    # Assuming the 'expiry' field in the JSON is in the format '19MAR2024'
-    df['expiry'] = df['expiry'].apply(lambda x: convert_date(x) if pd.notnull(x) else x)
-    df['expiry'] = df['expiry'].str.upper()
+    # Default symbol to brsymbol (for equities and other non-derivatives)
+    df['symbol'] = df['brsymbol']
 
-    
+    # Expiry: YYYYMMDD → DD-MMM-YY (uppercase)
+    df['expiry'] = pd.to_datetime(
+        df['expiry'].astype(str),
+        format='%Y%m%d',
+        errors='coerce'
+    ).dt.strftime('%d-%b-%y').str.upper()
+
+    # Strike price (options) - divide by 100
+    df['strike'] = df['strike_price'].fillna(0).astype(float) / 100
+
+    # Instrument type mapping
+    df['instrumenttype'] = None
+    df.loc[df['derivative_type'] == 'FUT', 'instrumenttype'] = 'FUT'
+    df.loc[df['option_type'] == 'CE', 'instrumenttype'] = 'CE'
+    df.loc[df['option_type'] == 'PE', 'instrumenttype'] = 'PE'
+
+    # For equities/cash - set instrumenttype to EQ
+    df.loc[df['asset_type'] == 'EQUITY', 'instrumenttype'] = 'EQ'
+
+    # Symbol construction (OpenAlgo standard format)
+    # Only process records with valid expiry
+    valid_expiry = df['expiry'].notna()
+
+    # Futures: SYMBOL[DDMMMYY]FUT
+    fut_mask = (df['instrumenttype'] == 'FUT') & valid_expiry
+    df.loc[fut_mask, 'symbol'] = (
+        df.loc[fut_mask, 'asset'] + df.loc[fut_mask, 'expiry'].str.replace('-', '', regex=False) + 'FUT'
+    )
+
+    # Options: SYMBOL[DDMMMYY][Strike][CE/PE]
+    opt_mask = df['instrumenttype'].isin(['CE', 'PE']) & valid_expiry
+    df.loc[opt_mask, 'symbol'] = (
+        df.loc[opt_mask, 'asset']
+        + df.loc[opt_mask, 'expiry'].str.replace('-', '', regex=False)
+        + df.loc[opt_mask, 'strike'].astype(int).astype(str)
+        + df.loc[opt_mask, 'instrumenttype']
+    )
+
+    # Return only required columns
+    return df[[
+        'symbol',
+        'brsymbol',
+        'name',
+        'exchange',
+        'brexchange',
+        'token',
+        'expiry',
+        'strike',
+        'lotsize',
+        'instrumenttype',
+        'tick_size',
+    ]]
 
 
-    # Convert 'strike' to float, 'lotsize' to int, and 'tick_size' to float as per the database schema
-    df['strike'] = df['strike'].astype(float) / 100
-    df.loc[(df['instrumenttype'] == 'OPTCUR') & (df['exchange'] == 'CDS'), 'strike'] = df['strike'].astype(float) / 100000
-    df.loc[(df['instrumenttype'] == 'OPTIRC') & (df['exchange'] == 'CDS'), 'strike'] = df['strike'].astype(float) / 100000
-    
-
-    df['lotsize'] = df['lotsize'].astype(int)
-    df['tick_size'] = df['tick_size'].astype(float) / 100  # Divide tick_size by 100
-
-    # Futures Symbol Update in CDS and MCX Exchanges
-    df.loc[(df['instrumenttype'] == 'FUTCUR') & (df['exchange'] == 'CDS'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + 'FUT'
-    df.loc[(df['instrumenttype'] == 'FUTIRC') & (df['exchange'] == 'CDS'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + 'FUT' 
-    df.loc[(df['instrumenttype'] == 'FUTCOM') & (df['exchange'] == 'MCX'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + 'FUT'
-    # Options Symbol Update in CDS and MCX Exchanges
-    df.loc[(df['instrumenttype'] == 'OPTCUR') & (df['exchange'] == 'CDS'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + df['strike'].astype(str).str.replace(r'\.0', '', regex=True) + df['symbol'].str[-2:]
-    df.loc[(df['instrumenttype'] == 'OPTIRC') & (df['exchange'] == 'CDS'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + df['strike'].astype(str).str.replace(r'\.0', '', regex=True) + df['symbol'].str[-2:]
-    df.loc[(df['instrumenttype'] == 'OPTFUT') & (df['exchange'] == 'MCX'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + df['strike'].astype(str).str.replace(r'\.0', '', regex=True) + df['symbol'].str[-2:]
-
-    # BFO Index Futures Symbol Update (SENSEX, BANKEX, etc.)
-    # Format: SYMBOL[DDMMMYY]FUT
-    # Example: SENSEX28MAR24FUT
-    df.loc[(df['instrumenttype'] == 'FUTIDX') & (df['exchange'] == 'BFO'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + 'FUT'
-
-    # BFO Stock Futures Symbol Update (RELIANCE, TCS, etc.)
-    # Format: SYMBOL[DDMMMYY]FUT
-    # Example: RELIANCE30OCT25FUT
-    df.loc[(df['instrumenttype'] == 'FUTSTK') & (df['exchange'] == 'BFO'), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + 'FUT'
-
-    # BFO Index Options Symbol Update (SENSEX, BANKEX, etc.)
-    # Format: SYMBOL[DDMMMYY][StrikePrice][CE/PE]
-    # Example: SENSEX28MAR2475000CE
-    df.loc[(df['instrumenttype'] == 'OPTIDX') & (df['exchange'] == 'BFO') & (df['symbol'].str.endswith('CE', na=False)), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + df['strike'].astype(str).str.replace(r'\.0', '', regex=True) + 'CE'
-    df.loc[(df['instrumenttype'] == 'OPTIDX') & (df['exchange'] == 'BFO') & (df['symbol'].str.endswith('PE', na=False)), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + df['strike'].astype(str).str.replace(r'\.0', '', regex=True) + 'PE'
-
-    # BFO Stock Options Symbol Update (RELIANCE, TCS, etc.)
-    # Format: SYMBOL[DDMMMYY][StrikePrice][CE/PE]
-    # Example: RELIANCE30OCT251330PE
-    df.loc[(df['instrumenttype'] == 'OPTSTK') & (df['exchange'] == 'BFO') & (df['symbol'].str.endswith('CE', na=False)), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + df['strike'].astype(str).str.replace(r'\.0', '', regex=True) + 'CE'
-    df.loc[(df['instrumenttype'] == 'OPTSTK') & (df['exchange'] == 'BFO') & (df['symbol'].str.endswith('PE', na=False)), 'symbol'] = df['name'] + df['expiry'].str.replace('-', '', regex=False) + df['strike'].astype(str).str.replace(r'\.0', '', regex=True) + 'PE'
-
-    # Common Index Symbol Formats
-
-    df['symbol'] = df['symbol'].replace({
-    'Nifty 50': 'NIFTY',
-    'Nifty Next 50': 'NIFTYNXT50',
-    'Nifty Fin Service': 'FINNIFTY',
-    'Nifty Bank': 'BANKNIFTY',
-    'NIFTY MID SELECT': 'MIDCPNIFTY',
-    'India VIX': 'INDIAVIX',
-    'SNSX50': 'SENSEX50'
-    })
-
-    # Convert instrumenttype from OPTIDX/OPTSTK to CE/PE (to match Zerodha format)
-    # This ensures consistency across brokers for option chain queries
-    df.loc[(df['instrumenttype'] == 'OPTIDX') & (df['symbol'].str.endswith('CE', na=False)), 'instrumenttype'] = 'CE'
-    df.loc[(df['instrumenttype'] == 'OPTIDX') & (df['symbol'].str.endswith('PE', na=False)), 'instrumenttype'] = 'PE'
-    df.loc[(df['instrumenttype'] == 'OPTSTK') & (df['symbol'].str.endswith('CE', na=False)), 'instrumenttype'] = 'CE'
-    df.loc[(df['instrumenttype'] == 'OPTSTK') & (df['symbol'].str.endswith('PE', na=False)), 'instrumenttype'] = 'PE'
-
-    # Return the processed DataFrame
-    return df
-
-def delete_angel_temp_data(output_path):
+def delete_nubra_temp_data(output_path):
     try:
-        # Check if the file exists
         if os.path.exists(output_path):
-            # Delete the file
             os.remove(output_path)
             logger.info(f"The temporary file {output_path} has been deleted.")
         else:
@@ -241,26 +203,20 @@ def delete_angel_temp_data(output_path):
 
 def master_contract_download():
     logger.info("Downloading Master Contract")
-    url = 'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json'
-    output_path = 'tmp/angel.json'
+    output_path = 'tmp/nubra.json'
     try:
-        download_json_angel_data(url,output_path)
-        token_df = process_angel_json(output_path)
-        delete_angel_temp_data(output_path)
-        #token_df['token'] = pd.to_numeric(token_df['token'], errors='coerce').fillna(-1).astype(int)
-        
-        #token_df = token_df.drop_duplicates(subset='symbol', keep='first')
+        download_nubra_instruments(output_path)
+        token_df = process_nubra_json(output_path)
+        delete_nubra_temp_data(output_path)
 
-        delete_symtoken_table()  # Consider the implications of this action
+        delete_symtoken_table()
         copy_from_dataframe(token_df)
-                
+
         return socketio.emit('master_contract_download', {'status': 'success', 'message': 'Successfully Downloaded'})
 
-    
     except Exception as e:
-        logger.info(f"{str(e)}")
+        logger.error(f"{str(e)}")
         return socketio.emit('master_contract_download', {'status': 'error', 'message': str(e)})
-
 
 
 def search_symbols(symbol, exchange):
