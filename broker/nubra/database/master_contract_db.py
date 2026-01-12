@@ -128,7 +128,10 @@ def process_nubra_json(path):
     - NSE + non-STOCK  -> exchange = NFO, brexchange = NSE
     - BSE + non-STOCK  -> exchange = BFO, brexchange = BSE
     - STOCK instruments keep their original exchange
-    - FUT & OPT expiry: YYYYMMDD -> DD-MMM-YY (handles float like 20260113.0)
+    - Expiry column remains in DB as DD-MMM-YY
+    - Symbol format follows OpenAlgo F&O spec:
+        FUT : [BASE][DDMMMYY]FUT
+        OPT : [BASE][DDMMMYY][STRIKE][CE/PE]
     """
 
     df = pd.read_json(path)
@@ -163,7 +166,7 @@ def process_nubra_json(path):
     # Default symbol = broker symbol (cash)
     df['symbol'] = df['brsymbol']
 
-    # ---- Expiry Handling (fix for float like 20260113.0) ----
+    # ---- Expiry Handling (keep DB format as DD-MMM-YY) ----
     expiry_series = df.get('expiry')
 
     expiry_dt = pd.to_datetime(
@@ -177,30 +180,34 @@ def process_nubra_json(path):
     fo_mask = df['instrumenttype'].isin(['FUT', 'CE', 'PE'])
     df.loc[fo_mask, 'expiry'] = (
         expiry_dt[fo_mask]
-        .dt.strftime('%d-%b-%y')
+        .dt.strftime('%d-%b-%y')   # keep DB format
         .str.upper()
     )
 
     # Strike price (options)
     df['strike'] = df.get('strike_price', 0).fillna(0).astype(float) / 100
 
-    # Symbol construction (OpenAlgo format)
+    # ---------------- Symbol Construction (OpenAlgo format) ----------------
+
     valid_expiry = df['expiry'].notna()
 
-    # Futures: SYMBOL[DDMMMYY]FUT
+    # Convert expiry for symbol: DD-MMM-YY -> DDMMMYY
+    sym_expiry = df['expiry'].str.replace('-', '', regex=False)
+
+    # Futures: BASE + DDMMMYY + FUT
     fut_mask = (df['instrumenttype'] == 'FUT') & valid_expiry
     df.loc[fut_mask, 'symbol'] = (
         df.loc[fut_mask, 'asset']
-        + df.loc[fut_mask, 'expiry'].str.replace('-', '', regex=False)
+        + sym_expiry[fut_mask]
         + 'FUT'
     )
 
-    # Options: SYMBOL[DDMMMYY][Strike][CE/PE]
+    # Options: BASE + DDMMMYY + STRIKE + CE/PE
     opt_mask = df['instrumenttype'].isin(['CE', 'PE']) & valid_expiry
     df.loc[opt_mask, 'symbol'] = (
         df.loc[opt_mask, 'asset']
-        + df.loc[opt_mask, 'expiry'].str.replace('-', '', regex=False)
-        + df.loc[opt_mask, 'strike'].astype(int).astype(str)
+        + sym_expiry[opt_mask]
+        + df.loc[opt_mask, 'strike'].astype(str).str.replace(r'\.0$', '', regex=True)
         + df.loc[opt_mask, 'instrumenttype']
     )
 
@@ -217,6 +224,7 @@ def process_nubra_json(path):
         'instrumenttype',
         'tick_size',
     ]]
+
 
 
 
