@@ -121,8 +121,16 @@ def download_nubra_instruments(output_path):
 
 def process_nubra_json(path):
     """
-    Processes the Nubra JSON file to fit the existing database schema.
+    Processes the Nubra JSON file to fit the existing database schema
+    and converts it into OpenAlgo master contract format.
+
+    Rules:
+    - NSE + non-STOCK  -> exchange = NFO, brexchange = NSE
+    - BSE + non-STOCK  -> exchange = BFO, brexchange = BSE
+    - STOCK instruments keep their original exchange
+    - FUT & OPT expiry: YYYYMMDD -> DD-MMM-YY (handles float like 20260113.0)
     """
+
     df = pd.read_json(path)
 
     # Basic field mappings
@@ -131,38 +139,60 @@ def process_nubra_json(path):
     df['tick_size'] = df['tick_size'].astype(float)
     df['name'] = df['asset']
     df['brsymbol'] = df['stock_name']
+
+    # Preserve broker exchange
     df['brexchange'] = df['exchange']
 
-    # Default symbol to brsymbol (for equities and other non-derivatives)
-    df['symbol'] = df['brsymbol']
-
-    # Expiry: YYYYMMDD → DD-MMM-YY (uppercase)
-    df['expiry'] = pd.to_datetime(
-        df['expiry'].astype(str),
-        format='%Y%m%d',
-        errors='coerce'
-    ).dt.strftime('%d-%b-%y').str.upper()
-
-    # Strike price (options) - divide by 100
-    df['strike'] = df['strike_price'].fillna(0).astype(float) / 100
+    # OpenAlgo exchange mapping
+    df['exchange'] = df.apply(
+        lambda r: (
+            'NFO' if (r['exchange'] == 'NSE' and r['derivative_type'] != 'STOCK')
+            else 'BFO' if (r['exchange'] == 'BSE' and r['derivative_type'] != 'STOCK')
+            else r['exchange']
+        ),
+        axis=1
+    )
 
     # Instrument type mapping
     df['instrumenttype'] = None
     df.loc[df['derivative_type'] == 'FUT', 'instrumenttype'] = 'FUT'
     df.loc[df['option_type'] == 'CE', 'instrumenttype'] = 'CE'
     df.loc[df['option_type'] == 'PE', 'instrumenttype'] = 'PE'
+    df.loc[df['derivative_type'] == 'STOCK', 'instrumenttype'] = 'EQ'
 
-    # For equities/cash - set instrumenttype to EQ
-    df.loc[df['asset_type'] == 'EQUITY', 'instrumenttype'] = 'EQ'
+    # Default symbol = broker symbol (cash)
+    df['symbol'] = df['brsymbol']
 
-    # Symbol construction (OpenAlgo standard format)
-    # Only process records with valid expiry
+    # ---- Expiry Handling (fix for float like 20260113.0) ----
+    expiry_series = df.get('expiry')
+
+    expiry_dt = pd.to_datetime(
+        expiry_series.fillna(0).astype('Int64').astype(str),
+        format='%Y%m%d',
+        errors='coerce'
+    )
+
+    # Apply expiry only for derivatives (FUT / CE / PE)
+    df['expiry'] = None
+    fo_mask = df['instrumenttype'].isin(['FUT', 'CE', 'PE'])
+    df.loc[fo_mask, 'expiry'] = (
+        expiry_dt[fo_mask]
+        .dt.strftime('%d-%b-%y')
+        .str.upper()
+    )
+
+    # Strike price (options)
+    df['strike'] = df.get('strike_price', 0).fillna(0).astype(float) / 100
+
+    # Symbol construction (OpenAlgo format)
     valid_expiry = df['expiry'].notna()
 
     # Futures: SYMBOL[DDMMMYY]FUT
     fut_mask = (df['instrumenttype'] == 'FUT') & valid_expiry
     df.loc[fut_mask, 'symbol'] = (
-        df.loc[fut_mask, 'asset'] + df.loc[fut_mask, 'expiry'].str.replace('-', '', regex=False) + 'FUT'
+        df.loc[fut_mask, 'asset']
+        + df.loc[fut_mask, 'expiry'].str.replace('-', '', regex=False)
+        + 'FUT'
     )
 
     # Options: SYMBOL[DDMMMYY][Strike][CE/PE]
@@ -174,7 +204,6 @@ def process_nubra_json(path):
         + df.loc[opt_mask, 'instrumenttype']
     )
 
-    # Return only required columns
     return df[[
         'symbol',
         'brsymbol',
@@ -188,6 +217,7 @@ def process_nubra_json(path):
         'instrumenttype',
         'tick_size',
     ]]
+
 
 
 def delete_nubra_temp_data(output_path):
