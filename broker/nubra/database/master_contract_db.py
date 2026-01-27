@@ -226,6 +226,145 @@ def process_nubra_json(path):
     ]]
 
 
+def download_nubra_indexes(output_path):
+    """
+    Downloads index data from Nubra public API (no authentication required).
+    URL: https://api.nubra.io/public/indexes?format=csv
+    """
+    url = 'https://api.nubra.io/public/indexes?format=csv'
+    logger.info("Downloading Nubra index data")
+    
+    response = requests.get(url, timeout=15)
+    
+    if response.status_code != 200:
+        logger.error(f"Failed to download index data: {response.text}")
+        raise Exception(f"Index data download failed with status {response.status_code}")
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'wb') as f:
+        f.write(response.content)
+    
+    logger.info("Index data download complete")
+
+
+def process_nubra_indexes(path):
+    """
+    Processes the Nubra index CSV file to fit the OpenAlgo database schema.
+    
+    CSV Structure from Nubra API:
+    - EXCHANGE: NSE or BSE
+    - INDEX_SYMBOL: Index symbol from Nubra (e.g., NIFTY, Nifty 50, etc.)
+    - ZANSKAR_INDEX_SYMBOL: Zanskar's internal symbol (preserved as brsymbol)
+    - INDEX_NAME: Full index name (e.g., "Nifty 50", "Nifty Bank")
+    
+    Output format follows OpenAlgo convention:
+    - exchange = NSE_INDEX or BSE_INDEX
+    - brexchange = NSE or BSE (original exchange)
+    - instrumenttype = 'INDEX'
+    - symbol = Standardized OpenAlgo format (NIFTY, BANKNIFTY, SENSEX, etc.)
+    - brsymbol = ZANSKAR_INDEX_SYMBOL (original broker symbol)
+    - token = ZANSKAR_INDEX_SYMBOL
+    
+    Common NSE Index Symbols: NIFTY, NIFTYNXT50, FINNIFTY, BANKNIFTY, MIDCPNIFTY, INDIAVIX
+    Common BSE Index Symbols: SENSEX, BANKEX, SENSEX50
+    """
+    df = pd.read_csv(path)
+    
+    # Map CSV columns to OpenAlgo database schema
+    df = df.rename(columns={
+        'EXCHANGE': 'brexchange',
+        'INDEX_SYMBOL': 'symbol',
+        'ZANSKAR_INDEX_SYMBOL': 'brsymbol',
+        'INDEX_NAME': 'name'
+    })
+    
+    # Use broker symbol as token
+    df['token'] = df['brsymbol'].astype(str)
+    
+    # Standardize common index symbols to OpenAlgo format (referencing Angel broker)
+    # Handle all variations including spaces, underscores, and different cases
+    # First strip whitespace to ensure clean matching
+    df['symbol'] = df['symbol'].str.strip()
+    
+    df['symbol'] = df['symbol'].replace({
+        # NSE Indexes - standardize to common OpenAlgo format
+        'Nifty 50': 'NIFTY',
+        'NIFTY 50': 'NIFTY',
+        'NIFTY_50': 'NIFTY',
+        'Nifty_50': 'NIFTY',
+        'Nifty Next 50': 'NIFTYNXT50',
+        'NIFTY NEXT 50': 'NIFTYNXT50',
+        'NIFTY_NEXT_50': 'NIFTYNXT50',
+        'Nifty Next50': 'NIFTYNXT50',
+        'NIFTYNEXT50': 'NIFTYNXT50',
+        'Nifty Fin Service': 'FINNIFTY',
+        'NIFTY FIN SERVICE': 'FINNIFTY',
+        'NIFTY_FIN_SERVICE': 'FINNIFTY',
+        'Nifty Financial Services': 'FINNIFTY',
+        'NIFTY FINANCIAL SERVICES': 'FINNIFTY',
+        'Nifty Bank': 'BANKNIFTY',
+        'NIFTY BANK': 'BANKNIFTY',
+        'NIFTY_BANK': 'BANKNIFTY',
+        'NIFTY MID SELECT': 'MIDCPNIFTY',
+        'Nifty Midcap Select': 'MIDCPNIFTY',
+        'Nifty MidCap Select': 'MIDCPNIFTY',
+        'NIFTY_MIDCAP_SELECT': 'MIDCPNIFTY',
+        'India VIX': 'INDIAVIX',
+        'INDIA VIX': 'INDIAVIX',
+        'INDIA_VIX': 'INDIAVIX',
+        'India_VIX': 'INDIAVIX',
+        'INDIAVIX': 'INDIAVIX',
+        # BSE Indexes - standardize to common OpenAlgo format
+        'S&P BSE SENSEX': 'SENSEX',
+        'BSE SENSEX': 'SENSEX',
+        'Bse Sensex': 'SENSEX',
+        'BSE_SENSEX': 'SENSEX',
+        'SENSEX': 'SENSEX',
+        'BSE BANKEX': 'BANKEX',
+        'Bse Bankex': 'BANKEX',
+        'BSE_BANKEX': 'BANKEX',
+        'BANKEX': 'BANKEX',
+        'SNSX50': 'SENSEX50',
+        'BSE SENSEX 50': 'SENSEX50',
+        'Bse Sensex 50': 'SENSEX50',
+        'BSE_SENSEX_50': 'SENSEX50',
+        'SENSEX 50': 'SENSEX50',
+        'SENSEX_50': 'SENSEX50',
+        'SENSEX50': 'SENSEX50',
+    })
+    
+    # Map to OpenAlgo index exchange format
+    # NSE indexes → NSE_INDEX, BSE indexes → BSE_INDEX
+    df['exchange'] = df['brexchange'].apply(
+        lambda x: (
+            'NSE_INDEX' if x == 'NSE'
+            else 'BSE_INDEX' if x == 'BSE'
+            else x + '_INDEX'
+        )
+    )
+    
+    # Index-specific fields
+    df['instrumenttype'] = 'INDEX'
+    df['expiry'] = None
+    df['strike'] = 0.0
+    df['lotsize'] = 0
+    df['tick_size'] = 0.05  # Default tick size for indexes
+    
+    return df[[
+        'symbol',
+        'brsymbol',
+        'name',
+        'exchange',
+        'brexchange',
+        'token',
+        'expiry',
+        'strike',
+        'lotsize',
+        'instrumenttype',
+        'tick_size',
+    ]]
+
+
 def delete_nubra_temp_data(output_path):
     try:
         if os.path.exists(output_path):
@@ -239,14 +378,26 @@ def delete_nubra_temp_data(output_path):
 
 def master_contract_download():
     logger.info("Downloading Master Contract")
-    output_path = 'tmp/nubra.json'
+    instruments_path = 'tmp/nubra_instruments.json'
+    indexes_path = 'tmp/nubra_indexes.csv'
+    
     try:
-        download_nubra_instruments(output_path)
-        token_df = process_nubra_json(output_path)
-        delete_nubra_temp_data(output_path)
-
+        # Download and process instrument data
+        download_nubra_instruments(instruments_path)
+        instruments_df = process_nubra_json(instruments_path)
+        delete_nubra_temp_data(instruments_path)
+        
+        # Download and process index data
+        download_nubra_indexes(indexes_path)
+        indexes_df = process_nubra_indexes(indexes_path)
+        delete_nubra_temp_data(indexes_path)
+        
+        # Combine both dataframes
+        combined_df = pd.concat([instruments_df, indexes_df], ignore_index=True)
+        
+        # Clear existing data and insert combined data
         delete_symtoken_table()
-        copy_from_dataframe(token_df)
+        copy_from_dataframe(combined_df)
 
         return socketio.emit('master_contract_download', {'status': 'success', 'message': 'Successfully Downloaded'})
 
